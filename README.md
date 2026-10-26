@@ -38,9 +38,27 @@ Ayarlar yereldir (`.git/config`, `.git/info/attributes`) ve commit'e girmez.
 
 Clean filter kullanınca git, notlu dosyayı "değişmemiş" sayar, çünkü temiz hâli index'tekiyle aynıdır. Bu yüzden dosyanın üzerine sormadan yazar. `fetch` diske dokunmaz, güvenlidir. Ama upstream'in dokunduğu bir dosyada `pull` (merge ya da rebase), conflict, `stash`/`--autostash`, branch değiştirme ve `reset --hard` notları siler. Smudge bu silinmeyi telafi eder.
 
+### Faz 0 spike sonuçları (git 2.50.1, 2026-10-26)
+
+Test, `sed` ile yazılmış basit bir clean filter ve her çağrıyı log'layan, içeriği değiştirmeden geçiren bir smudge filter ile yapıldı.
+
+| Durum | Sonuç |
+| --- | --- |
+| Notlu dosya, `add` edilmeden önce | `status` dosyayı ` M` gösteriyor. Git boyut farkını görünce içeriğe bakmıyor. |
+| Bu hâldeyken upstream'in değiştirdiği dosyaya `pull` | Reddediliyor ("Please commit your changes or stash them"), not güvende |
+| `add` ve commit sonrası | Disk notlu ama `working tree clean`. Git dosyayı temiz sayıyor. |
+| `pull` (merge), upstream dosyaya dokunmuş | **Not silindi.** Smudge çağrıldı. |
+| `pull` sırasında conflict | Conflict marker'lı dosya smudge'dan geçti. **Not silindi.** |
+| `stash` / `stash pop` | Stash'e temizlenmiş içerik girdi. **Not silindi.** İki kez smudge çağrıldı. |
+| Branch değiştirme | **Not silindi.** Smudge çağrıldı. |
+| `add -p` / `git diff` | Not satırları diff'te hiç görünmüyor |
+| `required=true` iken clean çökerse | `git add` exit 128 veriyor, index değişmiyor |
+
+**Sonuç:** notu silen her senaryoda git smudge'ı çağırıyor. Yani notları geri yerleştirmek için tek bir giriş noktası yeterli; plan geçerli.
+
 ## Fazlar
 
-- [ ] Faz 0: Kurulum ve git davranışlarının doğrulanması (spike)
+- [x] Faz 0: Kurulum ve git davranışlarının doğrulanması (spike)
 - [ ] Faz 1: Clean, Java/C# lexer'ı, install, pre-commit/pre-push check, yedek
 - [ ] Faz 2: Smudge, not anchoring, yetim yönetimi
 - [ ] Faz 3: Uçtan uca senaryo testleri (`test.sh`)
