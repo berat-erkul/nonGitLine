@@ -3,8 +3,9 @@
 
 Subcommands:
   install | uninstall        set up / remove the filter and hooks in the current repo
-  clean <path>               git clean filter: stdin -> stdout without notes; notes saved
-  smudge <path>              git smudge filter: puts saved notes back into what git writes
+  process                    git long-running filter (what install configures)
+  clean <path>               stdin -> stdout without notes; notes saved (same as the filter, for one file)
+  smudge <path>              stdin -> stdout with saved notes put back
   check pre-commit|pre-push  hook entry points
   orphans [--drop <path>]    list (or forget) notes that could not be put back
 """
@@ -17,6 +18,7 @@ import shlex
 import subprocess
 import sys
 import time
+import traceback
 
 MARKER = '//!!'
 EXTS = ('.java', '.cs')
@@ -283,34 +285,30 @@ def backup(path, data):
 
 # ---------------------------------------------------------------- filter
 
-def cmd_clean(path):
-    data = sys.stdin.buffer.read()
+def clean(path, data):
     has_marker = MARKER.encode() in data
     store = load_store(path)
     text = decode(data) if has_marker or store else None
     if text is None:
         if has_marker:
             print(f'nongitline: {path} is not UTF-8 text, left unchanged', file=sys.stderr)
-        sys.stdout.buffer.write(data)
-        return
-    bom, clean, blocks = split_notes(text, path.endswith('.cs'))
+        return data
+    bom, lines, blocks = split_notes(text, path.endswith('.cs'))
     # A failure here must fail `git add`: a note we cannot remember is a note smudge cannot restore.
-    save_store(path, {'base': clean, 'blocks': blocks, 'orphans': store['orphans'] if store else []})
+    save_store(path, {'base': lines, 'blocks': blocks, 'orphans': store['orphans'] if store else []})
     if blocks:
         try:
             backup(path, data)
         except OSError as e:  # the backup is a second safety net; never block git on it
             print(f'nongitline: backup of {path} failed: {e}', file=sys.stderr)
-    sys.stdout.buffer.write((bom + ''.join(clean)).encode('utf-8'))
+    return (bom + ''.join(lines)).encode('utf-8')
 
 
-def cmd_smudge(path):
-    data = sys.stdin.buffer.read()
+def smudge(path, data):
     store = load_store(path)
     text = decode(data) if store else None
     if text is None:
-        sys.stdout.buffer.write(data)
-        return
+        return data
     bom = '﻿' if text.startswith('﻿') else ''
     new = split_lines(text[len(bom):])
     out, blocks, orphans = place(store, new)
@@ -318,7 +316,59 @@ def cmd_smudge(path):
     if orphans:
         print(f'nongitline: {len(orphans)} note block(s) in {path} could not be put back; '
               f'they are kept, see: nongitline orphans', file=sys.stderr)
-    sys.stdout.buffer.write((bom + ''.join(out)).encode('utf-8'))
+    return (bom + ''.join(out)).encode('utf-8')
+
+
+# git's long-running filter protocol (man gitattributes, "Long Running Filter Process"):
+# one process serves every file of a git command instead of one python start per file.
+
+PKT_MAX = 65516
+
+
+def read_pkts(f):
+    """Read pkt-lines up to the next flush packet. EOFError when git hangs up."""
+    out = []
+    while True:
+        head = f.read(4)
+        if len(head) < 4:
+            raise EOFError
+        n = int(head, 16)
+        if n == 0:
+            return out
+        out.append(f.read(n - 4))
+
+
+def write_pkts(f, *items):
+    """Write each item as a pkt-line (None = flush packet)."""
+    for item in items:
+        f.write(b'0000' if item is None else b'%04x' % (len(item) + 4) + item)
+
+
+def cmd_process():
+    i, o = sys.stdin.buffer, sys.stdout.buffer
+    if read_pkts(i) != [b'git-filter-client\n', b'version=2\n']:
+        print('nongitline: unexpected filter handshake', file=sys.stderr)
+        return 1
+    write_pkts(o, b'git-filter-server\n', b'version=2\n', None)
+    o.flush()  # git waits for this before sending capabilities
+    caps = read_pkts(i)
+    write_pkts(o, *[c for c in (b'capability=clean\n', b'capability=smudge\n') if c in caps], None)
+    o.flush()
+    while True:
+        try:
+            meta = dict(l.rstrip(b'\n').decode('utf-8', 'surrogateescape').split('=', 1) for l in read_pkts(i))
+            data = b''.join(read_pkts(i))
+        except EOFError:
+            return 0
+        try:
+            out = {'clean': clean, 'smudge': smudge}[meta['command']](meta['pathname'], data)
+        except Exception:  # report this file as failed; `required` makes git stop instead of losing notes
+            traceback.print_exc()
+            write_pkts(o, b'status=error\n', None)
+        else:
+            write_pkts(o, b'status=success\n', None,
+                       *[out[k:k + PKT_MAX] for k in range(0, len(out), PKT_MAX)], None, None)
+        o.flush()
 
 
 def cmd_orphans(argv):
@@ -422,8 +472,7 @@ def cmd_install():
               f'Add this line to each, then re-run install:  {os.path.abspath(__file__)} check <hook-name> "$@"',
               sep='\n', file=sys.stderr)
         return 1
-    git('config', f'filter.{FILTER}.clean', f'{me} clean %f')
-    git('config', f'filter.{FILTER}.smudge', f'{me} smudge %f')
+    git('config', f'filter.{FILTER}.process', f'{me} process')
     git('config', f'filter.{FILTER}.required', 'true')
     attrs = os.path.join(git_dir(), 'info', 'attributes')
     os.makedirs(os.path.dirname(attrs), exist_ok=True)
@@ -458,10 +507,12 @@ def cmd_uninstall():
 
 
 def main(argv):
-    if argv[:1] == ['clean'] and len(argv) == 2:
-        return cmd_clean(argv[1])
-    if argv[:1] == ['smudge'] and len(argv) == 2:
-        return cmd_smudge(argv[1])
+    if argv == ['process']:
+        return cmd_process()
+    if argv[:1] in (['clean'], ['smudge']) and len(argv) == 2:
+        run = clean if argv[0] == 'clean' else smudge
+        sys.stdout.buffer.write(run(argv[1], sys.stdin.buffer.read()))
+        return 0
     if argv[:1] == ['orphans']:
         return cmd_orphans(argv[1:])
     if argv == ['check', 'pre-commit']:

@@ -91,17 +91,24 @@ git add crlf.cs bom.java noeol.java && git commit -qm bytes
 check "CRLF kept"            '[ "$(git cat-file blob HEAD:crlf.cs | od -c | head -1)" = "$(printf "a\r\nb\r\n" | od -c | head -1)" ]'
 check "BOM kept"             '[ "$(git cat-file blob HEAD:bom.java | head -c 3 | od -An -tx1 | tr -d " ")" = "efbbbf" ]'
 check "no-EOL note dropped"  '[ "$(git cat-file blob HEAD:noeol.java | od -c)" = "$(printf "x\n" | od -c)" ]'
+(echo '//!! big'; seq -f 'int b%g = 0; // padding to cross the 64 KB pkt-line limit' 1 8000) > Big.java
+git add Big.java && git commit -qm big
+check "big file split into packets" '[ "$(git show HEAD:Big.java)" = "$(sed 1d Big.java)" ]'
 
 # 11. a crashing filter stops `git add`
-git config filter.nongitline.clean false
+git config filter.nongitline.process false
 printf '//!! n2\ncode1\ncode2\nmore\n' > A.java
 check "broken filter: add fails"    '! git add A.java 2>/dev/null'
 check "broken filter: index intact" '! git show :A.java | grep -q more'
 "$NGL" install >/dev/null
+chmod 000 .git/nongitline/notes
+check "unsavable note: add fails"   '! git add A.java 2>/dev/null'
+check "unsavable note: index intact" '! git show :A.java | grep -q more'
+chmod 755 .git/nongitline/notes
 
 # 12. a note that slipped past the filter (hook skipped) is stopped at push
 git push -q origin main --no-verify 2>/dev/null
-git config --unset filter.nongitline.clean; git config filter.nongitline.required false
+git config --unset filter.nongitline.process; git config filter.nongitline.required false
 git add A.java && git commit -qm leak --no-verify
 "$NGL" install >/dev/null
 check "leaked note blocks push"   '! git push -q origin main 2>/dev/null'

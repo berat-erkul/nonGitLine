@@ -93,7 +93,9 @@ Test, `sed` ile yazılmış basit bir clean filter ve her çağrıyı log'layan,
 - [x] Faz 1: Clean, Java/C# lexer'ı, install, pre-commit/pre-push check, yedek
 - [x] Faz 2: Smudge, not anchoring, yetim yönetimi
   - Not deposu: `.git/nongitline/notes/<path>.json`. İçinde son görülen temiz içerik, not blokları ve yetimler var. Ayrıca son 20 notlu sürüm `.git/nongitline/backup/<path>/` altında yedekleniyor.
-- [x] Faz 3: Uçtan uca senaryo testleri (`test.sh`, 40 test)
+- [x] Faz 3: Uçtan uca senaryo testleri (`test.sh`, şu an 43 test)
   - Smudge kapatılınca not korumasıyla ilgili 14 testin hepsi FAIL veriyor; testler gerçekten not kaybını yakalıyor.
-- [ ] Faz 4 (gerekirse): `filter.process` ile hızlandırma
-  - Ölçüm: dosya başına ~30 ms (Python başlatma süresi). 300 dosyalık `add` ya da checkout ≈ 9 sn.
+- [x] Faz 4: `filter.process` ile hızlandırma
+  - Önce: her dosya için ayrı Python süreci açılıyordu, dosya başına ~30 ms. 300 dosyalık `add` ya da checkout ≈ 9 sn.
+  - Sonra: git komutu başına tek bir süreç açılıyor (long-running filter protokolü). Aynı işlem ≈ 0,17 sn.
+  - Bir dosyada hata olursa filtre `status=error` döner. `required=true` olduğu için git o işlemi durdurur, not kaybolmaz (testte not deposu yazılamaz hâle getirilerek denendi).
