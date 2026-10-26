@@ -107,6 +107,83 @@ git add A.java && git commit -qm leak --no-verify
 check "leaked note blocks push"   '! git push -q origin main 2>/dev/null'
 check "remote has no note"        '! git --git-dir=../origin.git show main:A.java | grep -q "//!!"'
 
+echo "== pull / branch / stash (notes must survive anything that rewrites the file)"
+cd "$T"
+git init -q --bare o2.git
+git clone -q o2.git me 2>/dev/null
+git clone -q o2.git up 2>/dev/null
+cd me && "$NGL" install >/dev/null
+seq -f 'line%g' 1 12 > P.java
+git add P.java && git commit -qm base && git push -q origin main
+# the note sits above line5
+sed -i '' 's|^line5$|//!! about line5\
+line5|' P.java
+git add P.java && git commit -qm note >/dev/null 2>&1  # nothing to commit: HEAD already equals the clean content
+has_note() { grep -qx '//!! about line5' P.java; }
+above5()   { [ "$(grep -A1 -x '//!! about line5' P.java | tail -1)" = line5 ]; }
+upstream() { (cd "$T/up" && git pull -q origin main 2>/dev/null; eval "$1"; git commit -qam up && git push -q origin main); }
+
+upstream "sed -i '' 's/^line11$/line11-up/' P.java"
+git pull -q --no-rebase origin main 2>/dev/null
+check "pull merge: note kept above line5" 'above5 && grep -qx line11-up P.java'
+check "pull merge: status clean"          '[ -z "$(git status --porcelain)" ]'
+
+upstream "sed -i '' 's/^line1$/line1-up/' P.java"
+sed -i '' 's/^line12$/line12-me/' P.java && git commit -qam mine
+git pull -q --rebase origin main 2>/dev/null
+check "pull --rebase: note kept"          'above5 && grep -qx line1-up P.java && grep -qx line12-me P.java'
+git push -q origin main
+
+upstream "sed -i '' 's/^line2$/line2-up/' P.java"
+sed -i '' 's/^line10$/line10-wip/' P.java
+git pull -q --rebase --autostash origin main >/dev/null 2>&1
+check "pull --autostash: note + wip kept" 'above5 && grep -qx line2-up P.java && grep -qx line10-wip P.java'
+git checkout -q -- P.java
+
+upstream "sed -i '' '/^line5$/d' P.java"
+git pull -q --no-rebase origin main 2>/dev/null
+check "next line deleted: note under prev" 'has_note && [ "$(grep -B1 -x "//!! about line5" P.java | head -1)" = line4 ]'
+
+upstream "sed -i '' '/^line4$/d; /^line6$/d' P.java"
+git pull -q --no-rebase origin main 2>"$T/err"
+check "both neighbours gone: orphaned"    '! has_note && grep -q "could not be put back" "$T/err"'
+check "orphans lists it"                  '"$NGL" orphans | grep -q "about line5"'
+"$NGL" orphans --drop P.java >/dev/null
+check "orphans --drop forgets it"         '! "$NGL" orphans | grep -q "about line5"'
+
+sed -i '' 's|^line7$|//!! about line7\
+line7|' P.java
+upstream "sed -i '' 's/^line7$/line7-up/' P.java"
+sed -i '' 's/^line7$/line7-me/' P.java && git commit -qam conflict
+git pull -q --no-rebase origin main >/dev/null 2>&1
+check "conflict: note kept or orphaned"   'grep -q "//!! about line7" P.java || "$NGL" orphans | grep -q "about line7"'
+printf '%s\n' line1-up line2-up line3 '//!! about line7' line7-both line8 line9 line10 line11-up line12-me > P.java
+git add P.java && git commit -qm merged && git push -q origin main
+has7() { grep -qx '//!! about line7' P.java; }
+check "conflict resolved: status clean"   'has7 && [ -z "$(git status --porcelain)" ]'
+
+git checkout -q -b other && sed -i '' 's/^line9$/line9-other/' P.java && git commit -qam other
+git checkout -q main
+check "branch switch: note kept"          'has7 && grep -qx line9 P.java'
+git checkout -q other
+check "branch back: note kept"            'has7 && grep -qx line9-other P.java'
+git checkout -q main
+git rm -q P.java 2>/dev/null; git commit -qm gone; git checkout -q HEAD~1 -- P.java 2>/dev/null
+check "file deleted then restored: note"  'has7'
+git reset -q --hard HEAD~1
+check "reset --hard: note kept"           'has7'
+sed -i '' 's/^line3$/line3-wip/' P.java
+git stash -q && check "stash: note kept"  'has7 && grep -qx line3 P.java'
+git stash pop -q && check "stash pop: note + wip" 'has7 && grep -qx line3-wip P.java'
+git checkout -q -- P.java
+sed -i '' '/about line7/d' P.java && git add P.java  # size changed: git wants an add, as with any edit
+git checkout -q other && git checkout -q main
+check "deleted note stays deleted"        '! has7'
+printf 'x\n//!! eof' > E.java && git add E.java && git commit -qm eof && git push -q origin main
+upstream "printf 'top\n' | cat - E.java > t && mv t E.java && git add E.java"
+git pull -q --no-rebase origin main 2>/dev/null
+check "no-EOL last note: still last"      '[ "$(tail -1 E.java)" = "//!! eof" ] && head -1 E.java | grep -qx top'
+
 "$NGL" uninstall >/dev/null
 check "uninstall clears config"   '! git config --get-regexp "^filter\.nongitline" >/dev/null'
 check "uninstall clears hooks"    '[ ! -e .git/hooks/pre-commit ] && [ ! -e .git/hooks/pre-push ]'

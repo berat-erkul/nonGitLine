@@ -41,6 +41,18 @@ Sonrasında `git add / commit / push` her zamanki gibi kullanılır. `uninstall`
 | `// !! not` | Commit durur, çünkü işaret yanlış yazılmış gibi görünüyor |
 | Text block / `@"..."` içinde satır başında `//!!` | Veri sayılır ve silinmez. Commit yine de durur ve sorar; bilerek yazıldıysa `--no-verify` ile geçilir |
 | Not bir şekilde commit'e sızdı | `push` reddedilir |
+| Not ekledin ya da sildin, `git add` yapmadın | `git status` dosyayı ` M` gösterir ama `git diff` boştur. Git, boyut değişince içeriğe bakmıyor. `git add` yapınca düzelir. Bu sırada git dosyanın üzerine yazmayı da reddeder, yani not güvende kalır. |
+| `pull` / `rebase` / `stash` / branch değiştirme / `reset --hard` | Notlar eski komşu satırlarına göre yerine konur |
+| Notun üstündeki ve altındaki satır upstream'de silindi | Not **yetim** olur: diske yazılmaz ama saklanır ve uyarı basılır |
+
+### Yetim notlar
+
+```bash
+nongitline orphans                 # yetimleri, eski komşu satırlarıyla listeler
+nongitline orphans --drop A.java   # o dosyanın yetimlerini unutur
+```
+
+Yetim notlar, git o dosyayı her yazdığında tekrar denenir. Eski komşu satır dosyada **tek bir yerde** aynen geçiyorsa not oraya konur. Notu elle yerine yapıştırırsan `--drop` ile listeden silebilirsin.
 
 Testler: `./test.sh`. Testler sistem Python'ı ile (`/usr/bin/python3`, 3.9) çalışır, çünkü Dock'tan açılan IntelliJ de bu Python'ı kullanır.
 
@@ -79,7 +91,9 @@ Test, `sed` ile yazılmış basit bir clean filter ve her çağrıyı log'layan,
 
 - [x] Faz 0: Kurulum ve git davranışlarının doğrulanması (spike)
 - [x] Faz 1: Clean, Java/C# lexer'ı, install, pre-commit/pre-push check, yedek
-  - ⚠️ Smudge henüz yok. Bu fazda `pull`, `stash` ve branch değişikliği notları hâlâ silebilir; o durumda notlar `.git/nongitline/backup/<path>/` içindeki son 20 yedekte durur.
-- [ ] Faz 2: Smudge, not anchoring, yetim yönetimi
-- [ ] Faz 3: Uçtan uca senaryo testleri (`test.sh`)
+- [x] Faz 2: Smudge, not anchoring, yetim yönetimi
+  - Not deposu: `.git/nongitline/notes/<path>.json`. İçinde son görülen temiz içerik, not blokları ve yetimler var. Ayrıca son 20 notlu sürüm `.git/nongitline/backup/<path>/` altında yedekleniyor.
+- [x] Faz 3: Uçtan uca senaryo testleri (`test.sh`, 40 test)
+  - Smudge kapatılınca not korumasıyla ilgili 14 testin hepsi FAIL veriyor; testler gerçekten not kaybını yakalıyor.
 - [ ] Faz 4 (gerekirse): `filter.process` ile hızlandırma
+  - Ölçüm: dosya başına ~30 ms (Python başlatma süresi). 300 dosyalık `add` ya da checkout ≈ 9 sn.

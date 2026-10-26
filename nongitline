@@ -3,9 +3,14 @@
 
 Subcommands:
   install | uninstall        set up / remove the filter and hooks in the current repo
-  clean <path>               git clean filter (stdin -> stdout, notes removed)
+  clean <path>               git clean filter: stdin -> stdout without notes; notes saved
+  smudge <path>              git smudge filter: puts saved notes back into what git writes
   check pre-commit|pre-push  hook entry points
+  orphans [--drop <path>]    list (or forget) notes that could not be put back
 """
+import difflib
+import functools
+import json
 import os
 import re
 import shlex
@@ -139,11 +144,80 @@ def open_string(line, i, cs):
     return (state, len(line)) if j < 0 else (None, j)
 
 
-def strip_notes(text, cs):
+def split_notes(text, cs):
+    """Return (bom, clean lines, blocks). A block is a run of note lines:
+    {'at': index of the clean line it sits above, 'lines': [...]}."""
     bom = '﻿' if text.startswith('﻿') else ''
     lines = split_lines(text[len(bom):])
-    kinds = line_kinds(lines, cs)
-    return bom + ''.join(l for l, k in zip(lines, kinds) if k != 'note')
+    clean, blocks = [], []
+    for line, kind in zip(lines, line_kinds(lines, cs)):
+        if kind != 'note':
+            clean.append(line)
+        elif blocks and blocks[-1]['at'] == len(clean):
+            blocks[-1]['lines'].append(line)
+        else:
+            blocks.append({'at': len(clean), 'lines': [line]})
+    return bom, clean, blocks
+
+
+def strip_notes(text, cs):
+    bom, clean, _ = split_notes(text, cs)
+    return bom + ''.join(clean)
+
+
+def place(store, new):
+    """Put the stored note blocks (and earlier orphans) into `new` clean lines.
+    Return (lines with notes, blocks, orphans).
+
+    A block goes above its old next line if that line survived unchanged
+    (difflib), else below its old previous line. Failing both, and for
+    orphans, a unique exact match of either neighbour is accepted. Anything
+    else stays an orphan: never guessed into place, never dropped."""
+    base = store['base']
+    pos = {}
+    for tag, i1, i2, j1, _ in difflib.SequenceMatcher(None, base, new, autojunk=False).get_opcodes():
+        if tag == 'equal':
+            pos.update((i1 + k, j1 + k) for k in range(i2 - i1))
+    todo = []  # (new index or None, orphan record)
+    for b in store['blocks']:
+        at = b['at']
+        j = pos.get(at)
+        if j is None and at - 1 in pos:
+            j = pos[at - 1] + 1
+        if j is None and not base:
+            j = 0
+        todo.append((j, {'lines': b['lines'],
+                         'before': base[at - 1] if at else None,
+                         'after': base[at] if at < len(base) else None}))
+    todo += [(None, o) for o in store['orphans']]
+    inserts, orphans = {}, []
+    for j, o in todo:
+        if j is None:
+            j = find_unique(new, o)
+        if j is None or (j and not new[j - 1].endswith('\n')):  # no line to hang it under without touching code
+            orphans.append(o)
+        else:
+            inserts.setdefault(j, []).append(o['lines'])
+    out, blocks = [], []
+    for j in range(len(new) + 1):
+        for lines in inserts.get(j, []):
+            if j < len(new) and not lines[-1].endswith('\n'):  # was the file's last line
+                lines = lines[:-1] + [lines[-1] + ('\r\n' if new[j].endswith('\r\n') else '\n')]
+            if blocks and blocks[-1]['at'] == j:
+                blocks[-1]['lines'] += lines
+            else:
+                blocks.append({'at': j, 'lines': list(lines)})
+            out += lines
+        if j < len(new):
+            out.append(new[j])
+    return out, blocks, orphans
+
+
+def find_unique(lines, orphan):
+    for anchor, shift in ((orphan['after'], 0), (orphan['before'], 1)):
+        if anchor is not None and lines.count(anchor) == 1:
+            return lines.index(anchor) + shift
+    return None
 
 
 def decode(data):
@@ -162,8 +236,34 @@ def git(*args, data=None):
     return subprocess.run(('git',) + args, input=data, stdout=subprocess.PIPE, check=True).stdout
 
 
+@functools.lru_cache(maxsize=None)
 def git_dir():
     return os.path.abspath(git('rev-parse', '--git-dir').decode().strip())
+
+
+def store_file(path):
+    return os.path.join(git_dir(), FILTER, 'notes', path + '.json')
+
+
+def load_store(path):
+    try:
+        with open(store_file(path)) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def save_store(path, store):
+    """{'base': clean lines last seen, 'blocks': [...], 'orphans': [...]}; written atomically."""
+    p = store_file(path)
+    if not store['blocks'] and not store['orphans']:
+        if os.path.exists(p):
+            os.remove(p)
+        return
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p + '.tmp', 'w') as f:
+        json.dump(store, f)
+    os.replace(p + '.tmp', p)
 
 
 def backup(path, data):
@@ -185,19 +285,65 @@ def backup(path, data):
 
 def cmd_clean(path):
     data = sys.stdin.buffer.read()
-    text = decode(data) if MARKER.encode() in data else None
+    has_marker = MARKER.encode() in data
+    store = load_store(path)
+    text = decode(data) if has_marker or store else None
     if text is None:
-        if MARKER.encode() in data:
+        if has_marker:
             print(f'nongitline: {path} is not UTF-8 text, left unchanged', file=sys.stderr)
         sys.stdout.buffer.write(data)
         return
-    out = strip_notes(text, path.endswith('.cs'))
-    if out != text:
+    bom, clean, blocks = split_notes(text, path.endswith('.cs'))
+    # A failure here must fail `git add`: a note we cannot remember is a note smudge cannot restore.
+    save_store(path, {'base': clean, 'blocks': blocks, 'orphans': store['orphans'] if store else []})
+    if blocks:
         try:
             backup(path, data)
-        except OSError as e:  # the backup is a safety net; never block git on it
+        except OSError as e:  # the backup is a second safety net; never block git on it
             print(f'nongitline: backup of {path} failed: {e}', file=sys.stderr)
-    sys.stdout.buffer.write(out.encode('utf-8'))
+    sys.stdout.buffer.write((bom + ''.join(clean)).encode('utf-8'))
+
+
+def cmd_smudge(path):
+    data = sys.stdin.buffer.read()
+    store = load_store(path)
+    text = decode(data) if store else None
+    if text is None:
+        sys.stdout.buffer.write(data)
+        return
+    bom = '﻿' if text.startswith('﻿') else ''
+    new = split_lines(text[len(bom):])
+    out, blocks, orphans = place(store, new)
+    save_store(path, {'base': new, 'blocks': blocks, 'orphans': orphans})
+    if orphans:
+        print(f'nongitline: {len(orphans)} note block(s) in {path} could not be put back; '
+              f'they are kept, see: nongitline orphans', file=sys.stderr)
+    sys.stdout.buffer.write((bom + ''.join(out)).encode('utf-8'))
+
+
+def cmd_orphans(argv):
+    if argv[:1] == ['--drop'] and len(argv) == 2:
+        store = load_store(argv[1])
+        if store:
+            store['orphans'] = []
+            save_store(argv[1], store)
+        print(f'nongitline: orphans of {argv[1]} dropped')
+        return 0
+    root = os.path.join(git_dir(), FILTER, 'notes')
+    top = git('rev-parse', '--show-toplevel').decode().strip()
+    for dirpath, _, names in os.walk(root):
+        for name in sorted(n for n in names if n.endswith('.json')):
+            path = os.path.relpath(os.path.join(dirpath, name), root)[:-len('.json')]
+            store = load_store(path)
+            if not os.path.exists(os.path.join(top, path)) and store['blocks']:
+                print(f'{path}: file not in the working tree; {len(store["blocks"])} note block(s) '
+                      f'come back when it does')
+            for o in store['orphans']:
+                print(f'{path}: was between')
+                print(f'    {(o["before"] or "<start of file>").rstrip()}')
+                print(f'    {(o["after"] or "<end of file>").rstrip()}')
+                print(''.join('  | ' + l.rstrip('\r\n') + '\n' for l in o['lines']), end='')
+    return 0
 
 
 # ---------------------------------------------------------------- checks
@@ -277,6 +423,7 @@ def cmd_install():
               sep='\n', file=sys.stderr)
         return 1
     git('config', f'filter.{FILTER}.clean', f'{me} clean %f')
+    git('config', f'filter.{FILTER}.smudge', f'{me} smudge %f')
     git('config', f'filter.{FILTER}.required', 'true')
     attrs = os.path.join(git_dir(), 'info', 'attributes')
     os.makedirs(os.path.dirname(attrs), exist_ok=True)
@@ -313,6 +460,10 @@ def cmd_uninstall():
 def main(argv):
     if argv[:1] == ['clean'] and len(argv) == 2:
         return cmd_clean(argv[1])
+    if argv[:1] == ['smudge'] and len(argv) == 2:
+        return cmd_smudge(argv[1])
+    if argv[:1] == ['orphans']:
+        return cmd_orphans(argv[1:])
     if argv == ['check', 'pre-commit']:
         return cmd_check_pre_commit()
     if argv[:2] == ['check', 'pre-push']:
