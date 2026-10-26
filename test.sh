@@ -7,6 +7,10 @@ T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 export PATH="/usr/bin:$PATH"  # run on the system python3 (what IDEs launched from the Dock get)
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+# isolate from the user's git config (pull.rebase, hooksPath, ...) and pin the branch name
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$T/gitconfig"
+printf '[init]\n\tdefaultBranch = main\n' > "$GIT_CONFIG_GLOBAL"
+sedi() { sed -i.bak "$@" && rm -f "${!#}.bak"; }  # in-place sed for both GNU and BSD
 FAILS=0
 ok()   { echo "ok   $1"; }
 fail() { echo "FAIL $1"; FAILS=$((FAILS + 1)); }
@@ -123,45 +127,45 @@ cd me && "$NGL" install >/dev/null
 seq -f 'line%g' 1 12 > P.java
 git add P.java && git commit -qm base && git push -q origin main
 # the note sits above line5
-sed -i '' 's|^line5$|//!! about line5\
+sedi 's|^line5$|//!! about line5\
 line5|' P.java
 git add P.java && git commit -qm note >/dev/null 2>&1  # nothing to commit: HEAD already equals the clean content
 has_note() { grep -qx '//!! about line5' P.java; }
 above5()   { [ "$(grep -A1 -x '//!! about line5' P.java | tail -1)" = line5 ]; }
 upstream() { (cd "$T/up" && git pull -q origin main 2>/dev/null; eval "$1"; git commit -qam up && git push -q origin main); }
 
-upstream "sed -i '' 's/^line11$/line11-up/' P.java"
+upstream "sedi 's/^line11$/line11-up/' P.java"
 git pull -q --no-rebase origin main 2>/dev/null
 check "pull merge: note kept above line5" 'above5 && grep -qx line11-up P.java'
 check "pull merge: status clean"          '[ -z "$(git status --porcelain)" ]'
 
-upstream "sed -i '' 's/^line1$/line1-up/' P.java"
-sed -i '' 's/^line12$/line12-me/' P.java && git commit -qam mine
+upstream "sedi 's/^line1$/line1-up/' P.java"
+sedi 's/^line12$/line12-me/' P.java && git commit -qam mine
 git pull -q --rebase origin main 2>/dev/null
 check "pull --rebase: note kept"          'above5 && grep -qx line1-up P.java && grep -qx line12-me P.java'
 git push -q origin main
 
-upstream "sed -i '' 's/^line2$/line2-up/' P.java"
-sed -i '' 's/^line10$/line10-wip/' P.java
+upstream "sedi 's/^line2$/line2-up/' P.java"
+sedi 's/^line10$/line10-wip/' P.java
 git pull -q --rebase --autostash origin main >/dev/null 2>&1
 check "pull --autostash: note + wip kept" 'above5 && grep -qx line2-up P.java && grep -qx line10-wip P.java'
 git checkout -q -- P.java
 
-upstream "sed -i '' '/^line5$/d' P.java"
+upstream "sedi '/^line5$/d' P.java"
 git pull -q --no-rebase origin main 2>/dev/null
 check "next line deleted: note under prev" 'has_note && [ "$(grep -B1 -x "//!! about line5" P.java | head -1)" = line4 ]'
 
-upstream "sed -i '' '/^line4$/d; /^line6$/d' P.java"
+upstream "sedi '/^line4$/d; /^line6$/d' P.java"
 git pull -q --no-rebase origin main 2>"$T/err"
 check "both neighbours gone: orphaned"    '! has_note && grep -q "could not be put back" "$T/err"'
 check "orphans lists it"                  '"$NGL" orphans | grep -q "about line5"'
 "$NGL" orphans --drop P.java >/dev/null
 check "orphans --drop forgets it"         '! "$NGL" orphans | grep -q "about line5"'
 
-sed -i '' 's|^line7$|//!! about line7\
+sedi 's|^line7$|//!! about line7\
 line7|' P.java
-upstream "sed -i '' 's/^line7$/line7-up/' P.java"
-sed -i '' 's/^line7$/line7-me/' P.java && git commit -qam conflict
+upstream "sedi 's/^line7$/line7-up/' P.java"
+sedi 's/^line7$/line7-me/' P.java && git commit -qam conflict
 git pull -q --no-rebase origin main >/dev/null 2>&1
 check "conflict: note kept or orphaned"   'grep -q "//!! about line7" P.java || "$NGL" orphans | grep -q "about line7"'
 printf '%s\n' line1-up line2-up line3 '//!! about line7' line7-both line8 line9 line10 line11-up line12-me > P.java
@@ -169,7 +173,7 @@ git add P.java && git commit -qm merged && git push -q origin main
 has7() { grep -qx '//!! about line7' P.java; }
 check "conflict resolved: status clean"   'has7 && [ -z "$(git status --porcelain)" ]'
 
-git checkout -q -b other && sed -i '' 's/^line9$/line9-other/' P.java && git commit -qam other
+git checkout -q -b other && sedi 's/^line9$/line9-other/' P.java && git commit -qam other
 git checkout -q main
 check "branch switch: note kept"          'has7 && grep -qx line9 P.java'
 git checkout -q other
@@ -179,11 +183,11 @@ git rm -q P.java 2>/dev/null; git commit -qm gone; git checkout -q HEAD~1 -- P.j
 check "file deleted then restored: note"  'has7'
 git reset -q --hard HEAD~1
 check "reset --hard: note kept"           'has7'
-sed -i '' 's/^line3$/line3-wip/' P.java
+sedi 's/^line3$/line3-wip/' P.java
 git stash -q && check "stash: note kept"  'has7 && grep -qx line3 P.java'
 git stash pop -q && check "stash pop: note + wip" 'has7 && grep -qx line3-wip P.java'
 git checkout -q -- P.java
-sed -i '' '/about line7/d' P.java && git add P.java  # size changed: git wants an add, as with any edit
+sedi '/about line7/d' P.java && git add P.java  # size changed: git wants an add, as with any edit
 git checkout -q other && git checkout -q main
 check "deleted note stays deleted"        '! has7'
 printf 'x\n//!! eof' > E.java && git add E.java && git commit -qm eof && git push -q origin main
