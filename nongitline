@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""nonGitLine: keep `//!!` note lines on disk but out of git commits.
+
+Subcommands:
+  install | uninstall        set up / remove the filter and hooks in the current repo
+  clean <path>               git clean filter (stdin -> stdout, notes removed)
+  check pre-commit|pre-push  hook entry points
+"""
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+MARKER = '//!!'
+EXTS = ('.java', '.cs')
+FILTER = 'nongitline'
+HOOK_TAG = '# nongitline-hook'
+ATTR_BEGIN, ATTR_END = '# >>> nongitline', '# <<< nongitline'
+BACKUPS_KEPT = 20
+TYPO = re.compile(r'[ \t]+!!')
+
+
+# ---------------------------------------------------------------- lexer
+
+def split_lines(text):
+    """Split keeping line endings; unlike str.splitlines, only '\\n' breaks a line."""
+    parts = text.split('\n')
+    lines = [p + '\n' for p in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+def close_string(line, i, kind, delim, interp=False):
+    """Scan from i inside a string literal. Return the index just past the
+    closing delimiter, or -1 if the string runs past the end of the line.
+    kind: 'esc' (backslash escapes), 'verb' (C# @"", "" escapes), 'raw' (none)."""
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if kind == 'esc' and c == '\\':
+            i += 2
+            continue
+        if kind == 'verb' and line.startswith('""', i):
+            i += 2
+            continue
+        if interp and c == '{':
+            if line.startswith('{{', i):
+                i += 2
+                continue
+            # ponytail: skips the hole by brace depth only; a string holding '}' inside a hole confuses it
+            depth = 0
+            while i < n:
+                depth += {'{': 1, '}': -1}.get(line[i], 0)
+                i += 1
+                if depth == 0:
+                    break
+            continue
+        if line.startswith(delim, i):
+            return i + len(delim)
+        i += 1
+    return -1
+
+
+def line_kinds(lines, cs):
+    """Classify each line: 'note' (whole-line marker in code), 'trailing'
+    (marker comment after code), 'typo' (e.g. `// !!`) or None.
+    A marker line inside a block comment is a note unless it also closes the
+    comment; inside a multi-line string it is data, never a note."""
+    kinds = []
+    state = None  # None = code, '*/' = block comment, else (kind, delim, interp) of an open string
+    for line in lines:
+        in_comment = state == '*/' and '*/' not in line
+        if (state is None or in_comment) and line.lstrip(' \t').startswith(MARKER):
+            kinds.append('note')
+            continue
+        kind, i, n, at_start = None, 0, len(line), True
+        while i < n:
+            if state == '*/':
+                j = line.find('*/', i)
+                if j < 0:
+                    break
+                state, i, at_start = None, j + 2, False
+                continue
+            if state is not None:
+                j = close_string(line, i, *state)
+                if j < 0:
+                    break
+                state, i, at_start = None, j, False
+                continue
+            c = line[i]
+            if c in ' \t\r\n':
+                i += 1
+            elif line.startswith('//', i):
+                body = line[i + 2:]
+                if body.startswith('!!'):
+                    kind = 'trailing'
+                elif at_start and TYPO.match(body):
+                    kind = 'typo'
+                break
+            elif line.startswith('/*', i):
+                state, i = '*/', i + 2
+            elif c == "'":
+                j = close_string(line, i + 1, 'esc', "'")
+                i, at_start = (n if j < 0 else j), False
+            elif c == '"':
+                state, i = open_string(line, i, cs)
+                at_start = False
+            else:
+                i, at_start = i + 1, False
+        kinds.append(kind)
+        if state is not None and state != '*/' and state[0] == 'esc' and state[1] == '"':
+            state = None  # an unterminated one-line string ends with the line
+    return kinds
+
+
+def open_string(line, i, cs):
+    """At a '"' in code: return (state, index). state is None if the string
+    closed on this line, else the open string to carry to the next line."""
+    q = len(line[i:]) - len(line[i:].lstrip('"'))
+    prefix = ''
+    k = i
+    while cs and k > 0 and line[k - 1] in '@$':
+        k -= 1
+        prefix = line[k] + prefix
+    verbatim, interp = '@' in prefix, '$' in prefix
+    if q >= 3 and not verbatim:
+        delim = '"' * q if cs else '"""'
+        state = ('raw', delim, False) if cs else ('esc', '"""', False)
+        i += len(delim)
+    elif q == 2:
+        return None, i + 2  # empty string
+    else:
+        state = ('verb', '"', interp) if verbatim else ('esc', '"', interp)
+        i += 1
+    j = close_string(line, i, *state)
+    return (state, len(line)) if j < 0 else (None, j)
+
+
+def strip_notes(text, cs):
+    bom = '﻿' if text.startswith('﻿') else ''
+    lines = split_lines(text[len(bom):])
+    kinds = line_kinds(lines, cs)
+    return bom + ''.join(l for l, k in zip(lines, kinds) if k != 'note')
+
+
+def decode(data):
+    """Bytes -> str, or None for content we must not touch (binary, non UTF-8)."""
+    if b'\0' in data:
+        return None
+    try:
+        return data.decode('utf-8')
+    except UnicodeDecodeError:
+        return None
+
+
+# ---------------------------------------------------------------- git helpers
+
+def git(*args, data=None):
+    return subprocess.run(('git',) + args, input=data, stdout=subprocess.PIPE, check=True).stdout
+
+
+def git_dir():
+    return os.path.abspath(git('rev-parse', '--git-dir').decode().strip())
+
+
+def backup(path, data):
+    """Keep the last BACKUPS_KEPT note-bearing versions of a file under .git/nongitline/backup."""
+    d = os.path.join(git_dir(), FILTER, 'backup', path)
+    os.makedirs(d, exist_ok=True)
+    names = sorted(os.listdir(d))
+    if names:
+        with open(os.path.join(d, names[-1]), 'rb') as f:
+            if f.read() == data:
+                return
+    with open(os.path.join(d, time.strftime('%Y%m%d-%H%M%S-') + str(time.time_ns())), 'wb') as f:
+        f.write(data)
+    for old in names[:len(names) + 1 - BACKUPS_KEPT]:
+        os.remove(os.path.join(d, old))
+
+
+# ---------------------------------------------------------------- filter
+
+def cmd_clean(path):
+    data = sys.stdin.buffer.read()
+    text = decode(data) if MARKER.encode() in data else None
+    if text is None:
+        if MARKER.encode() in data:
+            print(f'nongitline: {path} is not UTF-8 text, left unchanged', file=sys.stderr)
+        sys.stdout.buffer.write(data)
+        return
+    out = strip_notes(text, path.endswith('.cs'))
+    if out != text:
+        try:
+            backup(path, data)
+        except OSError as e:  # the backup is a safety net; never block git on it
+            print(f'nongitline: backup of {path} failed: {e}', file=sys.stderr)
+    sys.stdout.buffer.write(out.encode('utf-8'))
+
+
+# ---------------------------------------------------------------- checks
+
+def problems_in(path, data, typos):
+    text = decode(data)
+    if text is None:
+        return []
+    lines = split_lines(text.lstrip('﻿'))
+    found = []
+    for no, (line, kind) in enumerate(zip(lines, line_kinds(lines, path.endswith('.cs'))), 1):
+        if line.lstrip(' \t').startswith(MARKER):
+            why = 'note line would be committed'  # filter off, or the lexer thinks it is inside a string
+        elif kind == 'trailing':
+            why = 'trailing //!! note (only whole-line notes are removed)'
+        elif kind == 'typo' and typos:
+            why = 'looks like a mistyped //!! marker'
+        else:
+            continue
+        found.append(f'  {path}:{no}: {why}\n      {line.strip()}')
+    return found
+
+
+def cmd_check_pre_commit():
+    out = git('diff', '--cached', '--name-only', '--diff-filter=ACM', '-z').decode()
+    found = []
+    for path in filter(None, out.split('\0')):
+        if path.endswith(EXTS):
+            found += problems_in(path, git('cat-file', 'blob', ':' + path), typos=True)
+    if found:
+        print('nongitline: commit blocked (line numbers are in the staged version):', *found,
+              'Fix the lines, or commit with --no-verify if they are intended.', sep='\n', file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_check_pre_push():
+    blobs = {}  # sha -> (commit, path)
+    for line in sys.stdin:
+        local_ref, local_sha, remote_ref, remote_sha = line.split()
+        if set(local_sha) == {'0'}:
+            continue  # branch deletion
+        rng = [local_sha, '--not', '--remotes']
+        if set(remote_sha) != {'0'} and subprocess.run(['git', 'cat-file', '-e', remote_sha]).returncode == 0:
+            rng.append(remote_sha)
+        for commit in git('rev-list', *rng).decode().split():
+            out = git('diff-tree', '-r', '--root', '--no-commit-id', '--no-renames',
+                      '--diff-filter=ACM', '-z', commit).decode().split('\0')
+            for meta, path in zip(out[0::2], out[1::2]):
+                if path.endswith(EXTS):
+                    blobs.setdefault(meta.split()[3], (commit[:10], path))
+    found = []
+    for sha, (commit, path) in blobs.items():
+        found += problems_in(f'{commit}:{path}', git('cat-file', 'blob', sha), typos=False)
+    if found:
+        print('nongitline: push blocked, notes reached these commits:', *found,
+              'Rewrite those commits (amend/rebase), or push with --no-verify if intended.',
+              sep='\n', file=sys.stderr)
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------- install
+
+def hook_paths():
+    d = os.path.abspath(git('rev-parse', '--git-path', 'hooks').decode().strip())
+    return {name: os.path.join(d, name) for name in ('pre-commit', 'pre-push')}
+
+
+def cmd_install():
+    me = shlex.quote(os.path.abspath(__file__))
+    hooks = hook_paths()
+    foreign = [p for p in hooks.values() if os.path.exists(p) and HOOK_TAG not in open(p).read()]
+    if foreign:
+        print('nongitline: these hooks already exist and were not written by nongitline:', *foreign,
+              f'Add this line to each, then re-run install:  {os.path.abspath(__file__)} check <hook-name> "$@"',
+              sep='\n', file=sys.stderr)
+        return 1
+    git('config', f'filter.{FILTER}.clean', f'{me} clean %f')
+    git('config', f'filter.{FILTER}.required', 'true')
+    attrs = os.path.join(git_dir(), 'info', 'attributes')
+    os.makedirs(os.path.dirname(attrs), exist_ok=True)
+    block = '\n'.join([ATTR_BEGIN] + [f'*{e} filter={FILTER}' for e in EXTS] + [ATTR_END]) + '\n'
+    with open(attrs, 'a+') as f:
+        f.seek(0)
+        text = f.read()
+        if ATTR_BEGIN not in text:
+            f.write(('\n' if text and not text.endswith('\n') else '') + block)
+    os.makedirs(os.path.dirname(hooks['pre-commit']), exist_ok=True)
+    for name, p in hooks.items():
+        with open(p, 'w') as f:
+            f.write(f'#!/bin/sh\n{HOOK_TAG}\nexec {me} check {name} "$@"\n')
+        os.chmod(p, 0o755)
+    print('nongitline: installed. //!! lines in *.java and *.cs stay out of commits.')
+    return 0
+
+
+def cmd_uninstall():
+    subprocess.run(['git', 'config', '--remove-section', f'filter.{FILTER}'], stderr=subprocess.DEVNULL)
+    attrs = os.path.join(git_dir(), 'info', 'attributes')
+    if os.path.exists(attrs):
+        with open(attrs) as f:
+            text = f.read()
+        with open(attrs, 'w') as f:
+            f.write(re.sub(f'{re.escape(ATTR_BEGIN)}.*?{re.escape(ATTR_END)}\n?', '', text, flags=re.S))
+    for p in hook_paths().values():
+        if os.path.exists(p) and HOOK_TAG in open(p).read():
+            os.remove(p)
+    print('nongitline: removed. Note lines will now show up as changes and can be committed.')
+    return 0
+
+
+def main(argv):
+    if argv[:1] == ['clean'] and len(argv) == 2:
+        return cmd_clean(argv[1])
+    if argv == ['check', 'pre-commit']:
+        return cmd_check_pre_commit()
+    if argv[:2] == ['check', 'pre-push']:
+        return cmd_check_pre_push()
+    if argv == ['install']:
+        return cmd_install()
+    if argv == ['uninstall']:
+        return cmd_uninstall()
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]) or 0)
