@@ -31,6 +31,12 @@ The note lines are removed completely, not left as blank lines. Your file on dis
 
 ---
 
+## What is it?
+
+Not an IDE plugin and not an app: a single command-line script (Python, no dependencies) that you enable once per repository. `nongitline install` hooks it into git's own mechanisms, a [filter driver](https://git-scm.com/docs/gitattributes#_filter) and two hooks. From then on git calls it by itself on every `add`, `commit`, `pull`, `checkout` and `push`, whether you use the terminal, VS Code, IntelliJ or anything else.
+
+Nothing is added to your project's files: all settings live in `.git/`. Teammates who don't use nonGitLine see an ordinary repository.
+
 ## Why
 
 When you are learning a codebase, a framework or a course project, the most useful notes are the ones written next to the code they explain. You don't want them in the shared history, though. Your current options are:
@@ -52,6 +58,8 @@ nonGitLine works on single lines: your notes stay where you wrote them, and only
 - **Respects partial staging.** `git add -p` works as before; unstaged changes stay unstaged.
 - **Knows the language.** A small Java/C# lexer tells a comment from `//!!` inside a string, a Java text block, a C# verbatim string or a C# raw string literal.
 - **Preserves the file's bytes.** CRLF/LF line endings, a UTF-8 BOM and a missing final newline are kept as they were.
+- **Clean editor view (optional).** With `ide on`, VS Code stops marking note lines as changes and note-only edits leave the changed-files list.
+- **Every part can be switched off.** `off`, `ide off` and `uninstall` each take one command and never delete your notes.
 - **Fast.** One long-running process per git command: about 0.17 s for 300 files.
 - **No dependencies.** One Python file using only the standard library.
 - **Nothing is committed to your repo.** All configuration lives in `.git/`, so collaborators see a normal repository.
@@ -63,22 +71,52 @@ nonGitLine works on single lines: your notes stay where you wrote them, and only
 - git 2.11 or newer (tested with 2.50)
 - Supported languages: Java (`*.java`) and C# (`*.cs`)
 
-## Quick start
+## Getting started
+
+### 1. Get the tool (once per machine)
 
 ```bash
-# 1. Get the tool and put it on your PATH
 git clone https://github.com/berat-erkul/nonGitLine.git ~/tools/nonGitLine
 mkdir -p ~/.local/bin
 ln -s ~/tools/nonGitLine/nongitline ~/.local/bin/nongitline   # make sure ~/.local/bin is on PATH
-
-# 2. Enable it in a repository
-cd ~/code/my-project
-nongitline install
+nongitline   # prints the list of commands if everything is in place
 ```
 
-That's it. Write `//!!` notes and commit as usual.
+### 2. Enable it in a repository (once per repository)
+
+```bash
+cd ~/code/my-project
+nongitline install
+nongitline status   # filter : on / hooks : pre-commit, pre-push / ide : off
+```
 
 `install` writes the path it was called with into the repository's git config and hooks. If you install through the symlink above, you can later move the clone and only need to update the symlink.
+
+### 3. Optional: editor integration (VS Code)
+
+Without this step, your editor shows notes as changes: green gutter markers on note lines, and files listed as changed when only a note changed. Commits are correct either way; this step only cleans up what the editor shows.
+
+```bash
+nongitline ide on   # in each repository where you want it
+```
+
+For the changed-files list, also install the [Run on Save](https://marketplace.visualstudio.com/items?itemName=emeraldwalk.RunOnSave) extension and add the block from [Editor integration](#editor-integration) to your VS Code user settings once.
+
+### 4. Daily use
+
+Write notes on their own lines, starting with `//!!`, and use git as you always do: `add`, `commit`, `pull`, `push`, branches, stash. To check what will be committed for a file: `git show :path/to/File.java`.
+
+If git prints `could not be put back`, see [Orphans](#orphans-when-a-note-cant-find-its-place).
+
+### 5. If something looks wrong
+
+```bash
+nongitline ide off   # editor helpers off
+nongitline off       # filter off; the hooks still block committing notes
+nongitline uninstall # remove everything from this repository
+```
+
+None of these delete your notes. See [Switches](#switches).
 
 ### What `install` changes
 
@@ -114,7 +152,7 @@ A note is a **whole line** that starts with `//!!`, after optional indentation.
 | --- | --- |
 | `git add`, `git commit` | The commit contains your code without the notes |
 | `git diff`, `git add -p` | Notes never appear in diffs |
-| `git status` after **adding or removing a note** | The file shows as ` M` with an empty diff until you `git add` it (see [Limitations](#limitations)). In the meantime git refuses to overwrite the file, so the note is safe. |
+| `git status` after **adding or removing a note** | The file shows as ` M` with an empty diff until you `git add` it or `nongitline refresh` runs (see [Editor integration](#editor-integration)). In the meantime git refuses to overwrite the file, so the note is safe. |
 | `git fetch` | Nothing to do; fetch never touches your files |
 | `git pull` (merge or rebase), `--autostash`, conflicts | Notes are put back above the code they belong to |
 | `git switch` / `git checkout` and back | Notes come back on every branch where their code still exists |
@@ -151,11 +189,63 @@ As a second safety net, the last 20 versions of every file that contained notes 
 | --- | --- |
 | `nongitline install` | Enable in the current repository |
 | `nongitline uninstall` | Disable; your notes stay in your files |
+| `nongitline status` | Show what is switched on (filter, hooks, editor helpers) |
+| `nongitline off` / `on` | Switch the filter off / on (see [Switches](#switches)) |
+| `nongitline ide on` / `ide off` | Switch the editor helpers on / off (see [Editor integration](#editor-integration)) |
+| `nongitline refresh [file…]` | Drop note-only files from git's changed list (does nothing unless `ide on`) |
+| `nongitline textconv <file>` | Print a version of the file with the saved notes put back (used by editor diffs) |
 | `nongitline orphans [--drop <path>]` | List orphaned notes, or forget those of one file |
 | `nongitline clean <path> < file` | Print the file as it would be committed (for debugging) |
 | `nongitline smudge <path> < file` | Print the file with saved notes put back (for debugging) |
 | `nongitline check pre-commit\|pre-push` | Hook entry points |
 | `nongitline process` | The long-running filter that git starts by itself |
+
+## Switches
+
+nonGitLine changes how git and your editor see your files, so every part can be switched off with one command if something looks wrong. Switching off never deletes your notes or the note store; switching on picks up where you left off.
+
+```bash
+nongitline status      # filter : on / hooks : pre-commit, pre-push / ide : off
+nongitline off         # filter off
+nongitline on          # filter back on
+nongitline ide off     # editor helpers off
+```
+
+| Switch | When it's off |
+| --- | --- |
+| `off` | Git sees your files as they are, so notes show up as changes. **The hooks stay active and still block a commit or push that contains a note**, so turning the filter off can't leak them. Files you `git add` while it's off hold their notes in the index: `git add` them again after `nongitline on`. |
+| `ide off` | Editors show note lines as added again and note-only files stay in the changed list until `git add`. Everything else keeps working. |
+| `uninstall` | Removes everything, hooks included. |
+
+## Editor integration
+
+Without help, an editor shows notes as changes in two places:
+
+1. **Gutter markers.** The editor diffs your file against the committed version, where notes don't exist, so every note line is marked as added.
+2. **The changed-files list.** When you add or remove a note, the file size changes. Git reports a file as modified as soon as its size changes, without reading the content, so the file is listed even though `git diff` is empty.
+
+`nongitline ide on` (per repository, off by default) fixes both:
+
+- **Gutter:** a git *textconv* driver. VS Code reads the committed version with `git show --textconv <ref>:<path>`; nonGitLine hands it that version with your saved notes put back, so only real code changes are marked. The committed content itself is unchanged.
+- **Changed list:** `nongitline refresh` re-registers the same blob for files whose cleaned content equals the index, so git compares content instead of size and the file drops out of the list. Nothing is staged, and files with real changes are left alone. Run it on save from your editor:
+
+**VS Code:** install [Run on Save](https://marketplace.visualstudio.com/items?itemName=emeraldwalk.RunOnSave) (`emeraldwalk.RunOnSave`) and add to your *user* settings (once, for all repositories; it does nothing where `ide` is off):
+
+```jsonc
+"emeraldwalk.runonsave": {
+  "commands": [
+    {
+      "match": "\\.(java|cs)$",
+      "cmd": "/path/to/nongitline refresh \"${file}\"",
+      "isAsync": true
+    }
+  ]
+}
+```
+
+Use the full path to `nongitline`: editors started from the Dock do not see your shell's `PATH`. Partial staging from VS Code ("Stage Selected Ranges") stays safe: VS Code writes the staged content with `git hash-object --path`, which runs it through the filter.
+
+With `ide on`, a patch made with `git diff > file.patch` contains note lines as context and won't apply elsewhere. Use `git diff --no-textconv > file.patch` or `git format-patch` (which ignores textconv).
 
 ## How it works
 
@@ -193,7 +283,8 @@ Clean alone is not enough, and this is the core problem the tool solves. Once a 
 ## Limitations
 
 - **Notes live in this clone's `.git/` only.** A fresh clone, another machine or a deleted folder does not have them. This is by design.
-- **`git status` before `git add`.** When you add or remove a note, the file size changes and git reports the file as modified without looking at its content, so `git status` shows ` M` with an empty `git diff`. Running `git add` on the file clears it. Git itself behaves this way and a filter cannot change it.
+- **`git status` before `git add`.** When you add or remove a note, the file size changes and git reports the file as modified without looking at its content, so `git status` shows ` M` with an empty `git diff`. Git itself behaves this way and a filter cannot change it; `git add` or `nongitline refresh` (automatic on save with [editor integration](#editor-integration)) clears it.
+- **Other editors.** The textconv fix works for any tool that diffs through `git show --textconv` or `git diff`; it was verified against VS Code's source, not by clicking through VS Code. IntelliJ/Rider have not been checked yet.
 - **`git archive` includes notes.** Git runs smudge for archives too and sends the filter the same information as for a checkout, so the filter cannot tell them apart. Zipping the folder includes your notes for the same reason. GitHub's "Download ZIP" is built from the commits and is clean. For a local archive without notes:
   ```bash
   git -c filter.nongitline.process= -c filter.nongitline.required=false archive HEAD -o project.zip
@@ -206,7 +297,7 @@ Clean alone is not enough, and this is the core problem the tool solves. Once a 
 ## FAQ
 
 **Is this a plugin or an app?**
-Neither. It is a single command-line script that git calls through its filter and hook mechanisms. After `install` you don't run it yourself.
+Neither. It is a single command-line script that git calls through its filter and hook mechanisms. After `install` you don't run it yourself. The optional VS Code part is a setting for an existing extension, not a plugin of its own.
 
 **Why not just a pre-commit hook that removes notes from the index?**
 The index would then always differ from your file. `git status` and `git diff` would show your notes as permanent changes, `git commit --no-verify` would bypass the hook and leak the notes, and branch switches would be refused because of the "local changes". A filter avoids all three.
@@ -229,7 +320,7 @@ Only files that contain notes, or had notes before, do any real work. All other 
 ./test.sh
 ```
 
-The suite builds throwaway repositories with a fake remote and a second clone acting as a teammate. It covers 43 checks: lexer cases, partial staging, byte preservation, a crashing filter, a filter that cannot save notes, leak blocking at push, merge/rebase/autostash pulls, conflicts, branch switches, stash, `reset --hard`, orphans and files larger than one protocol packet. It runs on the system `python3` and on Linux and macOS in CI.
+The suite builds throwaway repositories with a fake remote and a second clone acting as a teammate. It covers 60 checks: lexer cases, partial staging, byte preservation, a crashing filter, a filter that cannot save notes, leak blocking at push, merge/rebase/autostash pulls, conflicts, branch switches, stash, `reset --hard`, orphans, files larger than one protocol packet, the on/off switches, `refresh` and the textconv driver. It runs on the system `python3` and on Linux and macOS in CI.
 
 To check that the tests actually catch note loss, the restore step was disabled in a copy of the tool: all 14 note-preservation checks failed as expected.
 
