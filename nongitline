@@ -3,6 +3,11 @@
 
 Subcommands:
   install | uninstall        set up / remove the filter and hooks in the current repo
+  on | off                   switch the filter on/off (notes are kept; the hooks keep guarding)
+  ide on | ide off           switch the editor helpers on/off (diff textconv + refresh)
+  status                     show what is switched on
+  refresh [file...]          drop note-only files from the "changed" list (no-op unless `ide on`)
+  textconv <file>            print a version with the saved notes put back (for editor diffs)
   process                    git long-running filter (what install configures)
   clean <path>               stdin -> stdout without notes; notes saved (same as the filter, for one file)
   smudge <path>              stdin -> stdout with saved notes put back
@@ -25,6 +30,7 @@ EXTS = ('.java', '.cs')
 FILTER = 'nongitline'
 HOOK_TAG = '# nongitline-hook'
 ATTR_BEGIN, ATTR_END = '# >>> nongitline', '# <<< nongitline'
+IDE_BEGIN, IDE_END = '# >>> nongitline-ide', '# <<< nongitline-ide'
 BACKUPS_KEPT = 20
 TYPO = re.compile(r'[ \t]+!!')
 
@@ -371,6 +377,81 @@ def cmd_process():
         o.flush()
 
 
+# ---------------------------------------------------------------- editor helpers
+# Editors (VS Code: `git show --textconv <ref>:<path>`) diff your file against the committed
+# version, where notes don't exist, so every note shows as an added line. With `ide on`,
+# a textconv driver hands them that version with the saved notes put back.
+
+def with_notes(arg, data):
+    """`data` (a version of the file named `arg`) with the saved notes put back. Read-only."""
+    text = decode(data)
+    if text is None:
+        return data
+    bom, lines, _ = split_notes(text, arg.endswith('.cs'))  # a working-tree file already has notes
+    if os.path.isabs(arg):  # git passes a temp copy (…/git-blob-XXXX/<name>) for committed versions
+        store = guess_store(os.path.basename(arg), lines)
+    else:
+        store = load_store(arg)
+    if not store:
+        return data
+    out, _, _ = place(store, lines)
+    return (bom + ''.join(out)).encode('utf-8')
+
+
+def guess_store(name, lines):
+    """The note store of a file called `name`; the most similar one if several share the name."""
+    root = os.path.join(git_dir(), FILTER, 'notes')
+    stores = []
+    for dirpath, _, names in os.walk(root):
+        if name + '.json' in names:
+            with open(os.path.join(dirpath, name + '.json')) as f:
+                stores.append(json.load(f))
+    if len(stores) > 1:
+        # ponytail: a full diff per candidate; fine for the handful of files sharing a name
+        return max(stores, key=lambda s: difflib.SequenceMatcher(None, s['base'], lines, autojunk=False).ratio())
+    return stores[0] if stores else None
+
+
+def cmd_textconv(arg):
+    with open(arg, 'rb') as f:
+        sys.stdout.buffer.write(with_notes(arg, f.read()))
+    return 0
+
+
+def cmd_refresh(files):
+    """Git marks a file modified as soon as its size changes, without reading it, so adding or
+    removing a note lists the file as changed with an empty diff. For each such file whose
+    clean content equals the index, re-register the same blob: git then compares by content."""
+    if files:
+        os.chdir(os.path.dirname(os.path.abspath(files[0])))
+    if subprocess.run(['git', 'rev-parse'], stderr=subprocess.DEVNULL).returncode or not is_on('ide'):
+        return 0  # not a repo, or switched off: an editor hook may call this anywhere
+    top = os.path.realpath(git('rev-parse', '--show-toplevel').decode().strip())
+    os.chdir(top)
+    paths = [os.path.relpath(os.path.realpath(f), top) for f in files] if files else \
+        git('ls-files', '-m', '-z').decode().split('\0')
+    same = []
+    for path in paths:
+        if not path.endswith(EXTS) or not os.path.isfile(path) or path.startswith('..'):
+            continue
+        entry = git('ls-files', '-s', '-z', '--', path).decode().split('\t')[0].split()
+        if len(entry) != 3 or entry[2] != '0':
+            continue  # untracked or in a merge conflict
+        if git('hash-object', '--', path).decode().strip() == entry[1]:
+            same.append(path)
+    forget_stat(same)
+    return 0
+
+
+def forget_stat(paths):
+    """Re-register the index entries of `paths` with the same blob but no stat data, so git
+    compares their content next time instead of trusting size and mtime. Nothing is staged."""
+    if paths:
+        entries = git('ls-files', '-s', '-z', '--', *paths)
+        git('update-index', '-z', '--index-info', data=entries)
+        subprocess.run(['git', 'update-index', '-q', '--refresh'], stdout=subprocess.DEVNULL)
+
+
 def cmd_orphans(argv):
     if argv[:1] == ['--drop'] and len(argv) == 2:
         store = load_store(argv[1])
@@ -463,8 +544,36 @@ def hook_paths():
     return {name: os.path.join(d, name) for name in ('pre-commit', 'pre-push')}
 
 
+ME = shlex.quote(os.path.abspath(__file__))
+
+
+def set_attr_block(begin, end, lines):
+    """Replace our block in .git/info/attributes with `lines` (None removes it)."""
+    attrs = os.path.join(git_dir(), 'info', 'attributes')
+    os.makedirs(os.path.dirname(attrs), exist_ok=True)
+    text = open(attrs).read() if os.path.exists(attrs) else ''
+    text = re.sub(f'^{re.escape(begin)}$.*?^{re.escape(end)}$\n?', '', text, flags=re.S | re.M)
+    if lines:
+        text += ('\n' if text and not text.endswith('\n') else '') + '\n'.join([begin] + lines + [end]) + '\n'
+    with open(attrs, 'w') as f:
+        f.write(text)
+
+
+def is_on(what):
+    key = {'filter': f'filter.{FILTER}.process', 'ide': f'diff.{FILTER}.textconv'}[what]
+    return subprocess.run(['git', 'config', '--get', key], stdout=subprocess.DEVNULL).returncode == 0
+
+
+def filter_on():
+    git('config', f'filter.{FILTER}.process', f'{ME} process')
+    git('config', f'filter.{FILTER}.required', 'true')
+
+
+def remove_config_section(name):
+    subprocess.run(['git', 'config', '--remove-section', name], stderr=subprocess.DEVNULL)
+
+
 def cmd_install():
-    me = shlex.quote(os.path.abspath(__file__))
     hooks = hook_paths()
     foreign = [p for p in hooks.values() if os.path.exists(p) and HOOK_TAG not in open(p).read()]
     if foreign:
@@ -472,37 +581,65 @@ def cmd_install():
               f'Add this line to each, then re-run install:  {os.path.abspath(__file__)} check <hook-name> "$@"',
               sep='\n', file=sys.stderr)
         return 1
-    git('config', f'filter.{FILTER}.process', f'{me} process')
-    git('config', f'filter.{FILTER}.required', 'true')
-    attrs = os.path.join(git_dir(), 'info', 'attributes')
-    os.makedirs(os.path.dirname(attrs), exist_ok=True)
-    block = '\n'.join([ATTR_BEGIN] + [f'*{e} filter={FILTER}' for e in EXTS] + [ATTR_END]) + '\n'
-    with open(attrs, 'a+') as f:
-        f.seek(0)
-        text = f.read()
-        if ATTR_BEGIN not in text:
-            f.write(('\n' if text and not text.endswith('\n') else '') + block)
+    filter_on()
+    set_attr_block(ATTR_BEGIN, ATTR_END, [f'*{e} filter={FILTER}' for e in EXTS])
     os.makedirs(os.path.dirname(hooks['pre-commit']), exist_ok=True)
     for name, p in hooks.items():
         with open(p, 'w') as f:
-            f.write(f'#!/bin/sh\n{HOOK_TAG}\nexec {me} check {name} "$@"\n')
+            f.write(f'#!/bin/sh\n{HOOK_TAG}\nexec {ME} check {name} "$@"\n')
         os.chmod(p, 0o755)
     print('nongitline: installed. //!! lines in *.java and *.cs stay out of commits.')
     return 0
 
 
 def cmd_uninstall():
-    subprocess.run(['git', 'config', '--remove-section', f'filter.{FILTER}'], stderr=subprocess.DEVNULL)
-    attrs = os.path.join(git_dir(), 'info', 'attributes')
-    if os.path.exists(attrs):
-        with open(attrs) as f:
-            text = f.read()
-        with open(attrs, 'w') as f:
-            f.write(re.sub(f'{re.escape(ATTR_BEGIN)}.*?{re.escape(ATTR_END)}\n?', '', text, flags=re.S))
+    remove_config_section(f'filter.{FILTER}')
+    remove_config_section(f'diff.{FILTER}')
+    set_attr_block(ATTR_BEGIN, ATTR_END, None)
+    set_attr_block(IDE_BEGIN, IDE_END, None)
     for p in hook_paths().values():
         if os.path.exists(p) and HOOK_TAG in open(p).read():
             os.remove(p)
     print('nongitline: removed. Note lines will now show up as changes and can be committed.')
+    return 0
+
+
+def cmd_switch(on):
+    """Filter on/off. Off leaves notes, the note store and the hooks in place, so a note
+    can't be committed by accident while the filter is off: the hooks still block it."""
+    if on:
+        filter_on()
+    else:
+        remove_config_section(f'filter.{FILTER}')
+    # git trusts the cached stat of unchanged files and would not notice the switch
+    forget_stat([p for p in git('ls-files', '-z').decode().split('\0') if p.endswith(EXTS)])
+    if on:
+        print('nongitline: filter on. //!! lines stay out of commits.\n'
+              'Files staged while it was off still hold their notes: `git add` them again.')
+    else:
+        print('nongitline: filter off. Notes show up as changes; the hooks still block committing them.\n'
+              'Turn it back on with: nongitline on')
+    return 0
+
+
+def cmd_ide(on):
+    if on:
+        git('config', f'diff.{FILTER}.textconv', f'{ME} textconv')
+        set_attr_block(IDE_BEGIN, IDE_END, [f'*{e} diff={FILTER}' for e in EXTS])
+        print('nongitline: editor helpers on. Diffs against committed versions include your notes,\n'
+              'and `nongitline refresh` clears note-only files from the changed list.')
+    else:
+        remove_config_section(f'diff.{FILTER}')
+        set_attr_block(IDE_BEGIN, IDE_END, None)
+        print('nongitline: editor helpers off.')
+    return 0
+
+
+def cmd_status():
+    hooks = [n for n, p in hook_paths().items() if os.path.exists(p) and HOOK_TAG in open(p).read()]
+    print(f'filter : {"on" if is_on("filter") else "off"}\n'
+          f'hooks  : {", ".join(hooks) or "none"}\n'
+          f'ide    : {"on" if is_on("ide") else "off"}')
     return 0
 
 
@@ -523,6 +660,16 @@ def main(argv):
         return cmd_install()
     if argv == ['uninstall']:
         return cmd_uninstall()
+    if argv in (['on'], ['off']):
+        return cmd_switch(argv[0] == 'on')
+    if argv in (['ide', 'on'], ['ide', 'off']):
+        return cmd_ide(argv[1] == 'on')
+    if argv == ['status']:
+        return cmd_status()
+    if argv[:1] == ['refresh']:
+        return cmd_refresh(argv[1:])
+    if argv[:1] == ['textconv'] and len(argv) == 2:
+        return cmd_textconv(argv[1])
     print(__doc__, file=sys.stderr)
     return 2
 

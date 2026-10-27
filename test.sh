@@ -195,7 +195,42 @@ upstream "printf 'top\n' | cat - E.java > t && mv t E.java && git add E.java"
 git pull -q --no-rebase origin main 2>/dev/null
 check "no-EOL last note: still last"      '[ "$(tail -1 E.java)" = "//!! eof" ] && head -1 E.java | grep -qx top'
 
+echo "== switches and editor helpers"
+printf 'class Q {\n//!! q note\nint a;\nint b;\n}\n' > Q.java
+git add Q.java && git commit -qm q
+check "status: filter on, ide off"       '"$NGL" status | grep -q "filter : on" && "$NGL" status | grep -q "ide    : off"'
+sedi 's|^int b;$|//!! b note\
+int b;|' Q.java
+check "note edit lists the file"         'git ls-files -m | grep -qx Q.java'
+"$NGL" refresh
+check "refresh: no-op while ide off"     'git ls-files -m | grep -qx Q.java'
+"$NGL" ide on >/dev/null
+(cd /; "$NGL" refresh "$T/me/Q.java")
+check "refresh clears note-only file"    '[ -z "$(git status --porcelain)" ] && ! git ls-files -m | grep -q Q.java'
+check "refresh stages nothing"           '[ -z "$(git diff --cached --name-only)" ]'
+sedi 's|^int a;$|int a2;|' Q.java
+"$NGL" refresh
+check "refresh keeps real changes"       'git ls-files -m | grep -qx Q.java && [ -z "$(git diff --cached --name-only)" ]'
+check "textconv: HEAD gets notes"        'git show --textconv HEAD:Q.java | grep -qx "//!! b note"'
+check "textconv: index gets notes"       'git show --textconv :Q.java | grep -qx "//!! q note"'
+check "raw HEAD still has no notes"      '! git show HEAD:Q.java | grep -q "//!!"'
+check "diff shows only the code change"  '[ "$(git diff Q.java | grep "^[-+][^-+]" | tr "\n" " ")" = "-int a; +int a2; " ]'
+printf 'y\n' | git add -p Q.java >/dev/null 2>&1
+check "add -p still works with ide on"   'git show :Q.java | grep -qx "int a2;" && ! git show :Q.java | grep -q "//!!"'
+git commit -qm a2
+"$NGL" ide off >/dev/null
+check "ide off: committed version plain" '! git show --textconv HEAD:Q.java | grep -q "//!!"'
+check "ide off: attributes block gone"   '! grep -q "diff=nongitline" .git/info/attributes'
+"$NGL" off >/dev/null
+check "filter off: notes show as changes" 'git diff Q.java | grep -q "^+//!! q note"'
+check "filter off: commit still blocked"  '! git commit -qam off 2>/dev/null'
+git reset -q Q.java
+"$NGL" on >/dev/null
+check "filter on: notes hidden again"    '! git diff Q.java | grep -q "//!!" && grep -qx "//!! q note" Q.java'
+
+"$NGL" ide on >/dev/null
 "$NGL" uninstall >/dev/null
+check "uninstall clears ide too"         '! git config --get diff.nongitline.textconv && ! grep -q nongitline .git/info/attributes'
 check "uninstall clears config"   '! git config --get-regexp "^filter\.nongitline" >/dev/null'
 check "uninstall clears hooks"    '[ ! -e .git/hooks/pre-commit ] && [ ! -e .git/hooks/pre-push ]'
 
